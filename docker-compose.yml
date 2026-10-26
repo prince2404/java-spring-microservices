@@ -1,0 +1,152 @@
+name: patient-management
+
+services:
+  auth-service-db:
+    image: postgres:17-alpine
+    environment:
+      # These names match the datasource configured for auth-service below.
+      POSTGRES_DB: auth-service-db
+      POSTGRES_USER: admin_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      # Keep auth users when containers are recreated.
+      - auth-service-db-data:/var/lib/postgresql/data
+    healthcheck:
+      # Spring starts only after PostgreSQL is accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U admin_user -d auth-service-db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  patient-service-db:
+    image: postgres:17-alpine
+    environment:
+      # A separate database prevents patient data from sharing auth tables.
+      POSTGRES_DB: patient-service-db
+      POSTGRES_USER: admin_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      # Keep patients when containers are recreated.
+      - patient-service-db-data:/var/lib/postgresql/data
+    healthcheck:
+      # Spring starts only after PostgreSQL is accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U admin_user -d patient-service-db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      # One KRaft node replaces ZooKeeper for this local-only setup.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # Advertise the Compose DNS name so Java containers never receive localhost.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      # A single broker cannot replicate internal topics to more than one node.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The patient topic is created on first producer/consumer use; no manual setup needed.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    expose:
+      # Available to Compose services, but deliberately not published to the laptop.
+      - "9092"
+    healthcheck:
+      # A metadata request confirms the broker, not just its process, is ready.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  auth-service:
+    build:
+      context: ./auth-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://auth-service-db:5432/auth-service-db
+      SPRING_DATASOURCE_USERNAME: admin_user
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # Both services ship seed SQL, so enable SQL initialization for PostgreSQL.
+      SPRING_SQL_INIT_MODE: always
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+    expose:
+      - "4005"
+    depends_on:
+      auth-service-db:
+        condition: service_healthy
+
+  billing-service:
+    build:
+      context: ./billing-service
+    expose:
+      # HTTP is internal-only; port 9001 is the patient service's gRPC endpoint.
+      - "4001"
+      - "9001"
+
+  patient-service:
+    build:
+      context: ./patient-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://patient-service-db:5432/patient-service-db
+      SPRING_DATASOURCE_USERNAME: admin_user
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      SPRING_SQL_INIT_MODE: always
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      # Map directly to @Value billing.service.* properties in BillingServiceGrpcClient.
+      BILLING_SERVICE_ADDRESS: billing-service
+      BILLING_SERVICE_GRPC_PORT: "9001"
+      # Spring Boot maps this to spring.kafka.bootstrap-servers.
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    expose:
+      - "4000"
+    depends_on:
+      patient-service-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      # The gRPC channel is opened at startup and used on patient creation.
+      billing-service:
+        condition: service_started
+
+  analytics-service:
+    build:
+      context: ./analytics-service
+    environment:
+      # Spring Boot maps this to spring.kafka.bootstrap-servers.
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    expose:
+      - "4002"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+    environment:
+      # The prod routes are Docker-safe and use Compose service DNS names.
+      SPRING_PROFILES_ACTIVE: prod
+      AUTH_SERVICE_URL: http://auth-service:4005
+    ports:
+      # This is the only port published to the laptop for Postman.
+      - "4004:4004"
+    depends_on:
+      auth-service:
+        condition: service_started
+      patient-service:
+        condition: service_started
+
+volumes:
+  # Named volumes preserve PostgreSQL data across `docker compose down` / `up`.
+  auth-service-db-data:
+  patient-service-db-data:
