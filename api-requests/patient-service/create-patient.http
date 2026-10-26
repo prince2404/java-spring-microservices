@@ -1,0 +1,13 @@
+### POST request create a patient
+POST http://localhost:4000/patients
+Content-Type: application/json
+
+{
+  "name": "rohan kumar Kafka Test",
+  "email": "kafka_test@gmail.com",
+  "address": "gali no.1, hari nagar",
+  "dateOfBirth": "2001-01-14",
+  "registeredDate": "2026-11-09"
+}
+
+###
